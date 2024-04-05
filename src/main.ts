@@ -1,16 +1,19 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 
-import { getScanStatus, startScan } from './api';
+import { getScanStatus, startScan, getScanFindings } from './api';
 import { getCurrentUnixTime, sleep } from './time';
 import { postScanStatusMessage } from './postMessage';
+import { postFindingsAsReviewComments } from './postReviewComment';
 import { transformPostScanStatusAsComment } from './transformers/transformPostScanStatusAsComment';
+import { transformPostFindingsAsReviewComment } from './transformers/transformPostFindingsAsReviewComment';
 
 const STATUS_FAILED = 'FAILED';
 const STATUS_SUCCEEDED = 'SUCCEEDED';
 const STATUS_TIMED_OUT = 'TIMED_OUT';
 
-const ALLOWED_POST_SCAN_STATUS_OPTIONS = ['on' , 'off' , 'only_if_new_findings'];
+const ALLOWED_POST_SCAN_STATUS_OPTIONS = ['on', 'off', 'only_if_new_findings'];
+const ALLOWED_POST_REVIEW_COMMENTS_OPTIONS = ['on', 'off'];
 
 async function run(): Promise<void> {
 	try {
@@ -22,6 +25,7 @@ async function run(): Promise<void> {
 		const failOnIacScan: string = core.getInput('fail-on-iac-scan');
 		const timeoutInSeconds = parseTimeoutDuration(core.getInput('timeout-seconds'));
 		let postScanStatusAsComment = core.getInput('post-scan-status-comment');
+		let postReviewComments = core.getInput('post-review-comments');
 
 		if (!['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(fromSeverity.toUpperCase())) {
 			core.setOutput('output', STATUS_FAILED);
@@ -33,6 +37,13 @@ async function run(): Promise<void> {
 		if (!ALLOWED_POST_SCAN_STATUS_OPTIONS.includes(postScanStatusAsComment)) {
 			core.setOutput('ouput', STATUS_FAILED);
 			core.setFailed(`Invalid property value for post-scan-status-comment. Allowed values are: ${ALLOWED_POST_SCAN_STATUS_OPTIONS.join(', ')}`);
+			return;
+		}
+
+		postReviewComments = transformPostFindingsAsReviewComment(postReviewComments);
+		if (!ALLOWED_POST_REVIEW_COMMENTS_OPTIONS.includes(postReviewComments)) {
+			core.setOutput('ouput', STATUS_FAILED);
+			core.setFailed(`Invalid property value for post-review-comments. Allowed values are: ${ALLOWED_POST_SCAN_STATUS_OPTIONS.join(', ')}`);
 			return;
 		}
 
@@ -57,10 +68,10 @@ async function run(): Promise<void> {
 			minimum_severity: fromSeverity,
 		};
 
-		if(secretKey){
+		if (secretKey) {
 			const redactedToken = '********************' + secretKey.slice(-4);
 			core.info(`starting a scan with secret key: "${redactedToken}"`);
-		}else{
+		} else {
 			const isLikelyDependabotPr = (startScanPayload.branch_name ?? '').starts_with('dependabot/')
 			if (isLikelyDependabotPr) {
 				core.info(`it looks like the action is running on a dependabot PR, this means that secret variables are not available in this context and thus we can not start a scan. Please see: https://github.blog/changelog/2021-02-19-github-actions-workflows-triggered-by-dependabot-prs-will-run-with-read-only-permissions/`);
@@ -131,6 +142,33 @@ async function run(): Promise<void> {
 						core.info(`unable to post scan status comment due to error: ${error.message}`);
 					} else {
 						core.info(`unable to post scan status comment due to unknown error`);
+					}
+				}
+			}
+
+			const shouldPostReviewComments = (postReviewComments === 'on');
+			if (shouldPostReviewComments) {
+				try {
+					const findingResponse = await getScanFindings(secretKey, scanId)
+
+					const findings = findingResponse.introduced_sast_issues.map(finding => (
+						{
+							commit_id: findingResponse.end_commit_id,
+							path: finding.file,
+							line: finding.end_line,
+							start_line: finding.start_line,
+							body: `**Finding:** ${finding.title}\n**Description:** ${finding.description}\n**Possible remediation:** ${finding.remediation}\n**Details**: [View details](https://app.aikido.dev/featurebranch/scan/${scanId})`
+						}
+					))
+					
+					if (findings.length > 0) {
+						await postFindingsAsReviewComments(findings);
+					}
+				} catch (error) {
+					if (error instanceof Error) {
+						core.info(`unable to post review comments due to error: ${error.message}`);
+					} else {
+						core.info(`unable to post review comments due to unknown error`);
 					}
 				}
 			}
